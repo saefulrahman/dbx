@@ -585,9 +585,20 @@ fn classify_couchdb_query_risk(source: &str) -> Option<SearchEngineQueryRisk> {
     match method.as_str() {
         "GET" | "HEAD" | "OPTIONS" => Some(SearchEngineQueryRisk::ReadOnly),
         "POST"
+            if segments.last().is_some_and(|s| {
+                s.eq_ignore_ascii_case("_find")
+                    || s.eq_ignore_ascii_case("_explain")
+                    || s.eq_ignore_ascii_case("_all_docs")
+                    || s.eq_ignore_ascii_case("_bulk_get")
+            }) =>
+        {
+            Some(SearchEngineQueryRisk::ReadOnly)
+        }
+        // 视图查询（POST /{db}/_design/{doc}/_view/{name} 带 keys 等参数）只读。
+        "POST"
             if segments
-                .last()
-                .is_some_and(|s| s.eq_ignore_ascii_case("_find") || s.eq_ignore_ascii_case("_explain") || s.eq_ignore_ascii_case("_all_docs")) =>
+                .windows(3)
+                .any(|w| w[0].eq_ignore_ascii_case("_design") && w[2].eq_ignore_ascii_case("_view")) =>
         {
             Some(SearchEngineQueryRisk::ReadOnly)
         }
@@ -2683,6 +2694,24 @@ mod tests {
         assert_eq!(
             classify_search_engine_query_risk("POST /mydb/_find\n{\"selector\":{}}", DatabaseType::CouchDb),
             Some(SearchEngineQueryRisk::ReadOnly)
+        );
+        assert_eq!(
+            classify_search_engine_query_risk(
+                "POST /mydb/_bulk_get\n{\"docs\":[{\"id\":\"a\"}]}",
+                DatabaseType::CouchDb
+            ),
+            Some(SearchEngineQueryRisk::ReadOnly)
+        );
+        assert_eq!(
+            classify_search_engine_query_risk(
+                "POST /mydb/_design/users/_view/by_name\n{\"keys\":[\"a\"]}",
+                DatabaseType::CouchDb
+            ),
+            Some(SearchEngineQueryRisk::ReadOnly)
+        );
+        assert_eq!(
+            classify_search_engine_query_risk("POST /mydb/_design/users/_info", DatabaseType::CouchDb),
+            Some(SearchEngineQueryRisk::Write)
         );
         assert_eq!(
             classify_search_engine_query_risk("POST /mydb\n{\"name\":\"doc\"}", DatabaseType::CouchDb),

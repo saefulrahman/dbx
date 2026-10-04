@@ -11,17 +11,8 @@ use crate::db::ColumnInfo;
 use crate::models::connection::DatabaseConnectionInfo;
 use crate::types::QueryResult;
 
-const COUCHDB_PATH_ENCODE_SET: &AsciiSet = &CONTROLS
-    .add(b' ')
-    .add(b'"')
-    .add(b'#')
-    .add(b'<')
-    .add(b'>')
-    .add(b'`')
-    .add(b'?')
-    .add(b'{')
-    .add(b'}')
-    .add(b'/');
+const COUCHDB_PATH_ENCODE_SET: &AsciiSet =
+    &CONTROLS.add(b' ').add(b'"').add(b'#').add(b'<').add(b'>').add(b'`').add(b'?').add(b'{').add(b'}').add(b'/');
 
 fn encode_path_segment(value: &str) -> String {
     utf8_percent_encode(value, COUCHDB_PATH_ENCODE_SET).to_string()
@@ -185,8 +176,7 @@ pub async fn get_columns(client: &CouchDbClient, database: &str) -> Result<Vec<C
     if resp.status().is_success() {
         if let Ok(body) = resp.json::<Value>().await {
             if let Some(rows) = body.get("rows").and_then(Value::as_array) {
-                let mut seen: HashSet<String> =
-                    ["_id".to_string(), "_rev".to_string()].into_iter().collect();
+                let mut seen: HashSet<String> = ["_id".to_string(), "_rev".to_string()].into_iter().collect();
                 for row in rows {
                     if let Some(doc) = row.get("doc").and_then(Value::as_object) {
                         for (k, v) in doc {
@@ -216,16 +206,15 @@ pub async fn get_columns(client: &CouchDbClient, database: &str) -> Result<Vec<C
     Ok(columns)
 }
 
-fn parse_couchdb_sort(sort: Option<&str>) -> Option<Value> {
-    let sort = sort?.trim();
-    if sort.is_empty() {
-        return None;
-    }
-    if let Ok(val) = serde_json::from_str::<Value>(sort) {
-        if val.is_array() {
-            return Some(val);
-        }
-        if let Value::Object(map) = val {
+fn parse_couchdb_sort(sort: Option<&str>) -> Result<Option<Value>, String> {
+    let sort = match sort {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => return Ok(None),
+    };
+    let parsed = serde_json::from_str::<Value>(sort).map_err(|e| format!("Invalid sort JSON: {e}"))?;
+    match parsed {
+        Value::Array(val) => Ok(Some(Value::Array(val))),
+        Value::Object(map) => {
             let mut list = Vec::new();
             for (k, v) in map {
                 let dir = match v {
@@ -236,28 +225,32 @@ fn parse_couchdb_sort(sort: Option<&str>) -> Option<Value> {
                 list.push(serde_json::json!({ k: dir }));
             }
             if !list.is_empty() {
-                return Some(Value::Array(list));
+                Ok(Some(Value::Array(list)))
+            } else {
+                Ok(None)
             }
         }
+        _ => Err(format!("CouchDB sort must be a JSON array or object, got: {sort}")),
     }
-    None
 }
 
-fn parse_couchdb_selector(filter: Option<&str>) -> Value {
+fn parse_couchdb_selector(filter: Option<&str>) -> Result<Value, String> {
     let filter = match filter {
         Some(f) if !f.trim().is_empty() => f.trim(),
-        _ => return serde_json::json!({ "_id": { "$gt": null } }),
+        _ => return Ok(serde_json::json!({ "_id": { "$gt": null } })),
     };
 
-    if let Ok(parsed) = serde_json::from_str::<Value>(filter) {
-        if let Value::Object(ref map) = parsed {
-            if map.contains_key("selector") {
-                return map.get("selector").cloned().unwrap_or(serde_json::json!({ "_id": { "$gt": null } }));
+    let parsed = serde_json::from_str::<Value>(filter).map_err(|e| format!("Invalid filter JSON: {e}"))?;
+    match parsed {
+        Value::Object(ref map) => {
+            if let Some(selector) = map.get("selector") {
+                Ok(selector.clone())
+            } else {
+                Ok(parsed)
             }
-            return parsed;
         }
+        _ => Err(format!("CouchDB selector must be a JSON object, got: {filter}")),
     }
-    serde_json::json!({ "_id": { "$gt": null } })
 }
 
 async fn find_documents_impl(
@@ -270,8 +263,8 @@ async fn find_documents_impl(
     cursor: Option<&str>,
 ) -> Result<DocumentQueryResult, String> {
     let encoded_db = encode_path_segment(database);
-    let has_filter = filter.map_or(false, |f| !f.trim().is_empty());
-    let parsed_sort = parse_couchdb_sort(sort);
+    let has_filter = filter.is_some_and(|f| !f.trim().is_empty());
+    let parsed_sort = parse_couchdb_sort(sort)?;
 
     if !has_filter && parsed_sort.is_none() && cursor.is_none() {
         // Fast path: use _all_docs
@@ -306,7 +299,7 @@ async fn find_documents_impl(
     }
 
     // Mango query: POST /{db}/_find
-    let selector = parse_couchdb_selector(filter);
+    let selector = parse_couchdb_selector(filter)?;
     let mut payload = serde_json::json!({
         "selector": selector,
         "limit": limit
@@ -355,7 +348,8 @@ async fn find_documents_impl(
         raw_documents: Some(raw_documents),
         extended_documents: None,
         total,
-        total_is_exact: true,
+        // count_documents 忽略 selector，返回全库 doc_count；带过滤时不是精确总数。
+        total_is_exact: !has_filter,
         next_cursor,
     })
 }
@@ -386,13 +380,10 @@ pub async fn close_cursor(_client: &CouchDbClient, _cursor: &str) -> Result<(), 
     Ok(())
 }
 
-pub async fn count_documents(
-    client: &CouchDbClient,
-    database: &str,
-    _filter: Option<&str>,
-) -> Result<u64, String> {
+pub async fn count_documents(client: &CouchDbClient, database: &str, _filter: Option<&str>) -> Result<u64, String> {
     let encoded_db = encode_path_segment(database);
-    let resp = client.get(&format!("/{encoded_db}")).send().await.map_err(|e| format!("CouchDB request failed: {e}"))?;
+    let resp =
+        client.get(&format!("/{encoded_db}")).send().await.map_err(|e| format!("CouchDB request failed: {e}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -403,11 +394,7 @@ pub async fn count_documents(
     Ok(doc_count)
 }
 
-pub async fn insert_document(
-    client: &CouchDbClient,
-    database: &str,
-    doc_json: &str,
-) -> Result<String, String> {
+pub async fn insert_document(client: &CouchDbClient, database: &str, doc_json: &str) -> Result<String, String> {
     let encoded_db = encode_path_segment(database);
     let doc: Value = serde_json::from_str(doc_json).map_err(|e| format!("Invalid JSON: {e}"))?;
     let id_opt = doc.get("_id").and_then(Value::as_str).map(str::to_string);
@@ -433,7 +420,11 @@ pub async fn insert_document(
 async fn fetch_doc_rev(client: &CouchDbClient, database: &str, id: &str) -> Result<Option<String>, String> {
     let encoded_db = encode_path_segment(database);
     let encoded_id = encode_path_segment(id);
-    let resp = client.head(&format!("/{encoded_db}/{encoded_id}")).send().await.map_err(|e| format!("CouchDB request failed: {e}"))?;
+    let resp = client
+        .head(&format!("/{encoded_db}/{encoded_id}"))
+        .send()
+        .await
+        .map_err(|e| format!("CouchDB request failed: {e}"))?;
     if !resp.status().is_success() {
         return Ok(None);
     }
@@ -444,12 +435,7 @@ async fn fetch_doc_rev(client: &CouchDbClient, database: &str, id: &str) -> Resu
     Ok(None)
 }
 
-pub async fn update_document(
-    client: &CouchDbClient,
-    database: &str,
-    id: &str,
-    doc_json: &str,
-) -> Result<u64, String> {
+pub async fn update_document(client: &CouchDbClient, database: &str, id: &str, doc_json: &str) -> Result<u64, String> {
     let encoded_db = encode_path_segment(database);
     let encoded_id = encode_path_segment(id);
     let mut doc: Value = serde_json::from_str(doc_json).map_err(|e| format!("Invalid JSON: {e}"))?;
@@ -478,16 +464,10 @@ pub async fn update_document(
     Ok(1)
 }
 
-pub async fn delete_document(
-    client: &CouchDbClient,
-    database: &str,
-    id: &str,
-) -> Result<u64, String> {
+pub async fn delete_document(client: &CouchDbClient, database: &str, id: &str) -> Result<u64, String> {
     let encoded_db = encode_path_segment(database);
     let encoded_id = encode_path_segment(id);
-    let rev = fetch_doc_rev(client, database, id)
-        .await?
-        .ok_or_else(|| format!("Document '{id}' not found"))?;
+    let rev = fetch_doc_rev(client, database, id).await?.ok_or_else(|| format!("Document '{id}' not found"))?;
     let path = format!("/{encoded_db}/{encoded_id}?rev={rev}");
     let resp = client.delete(&path).send().await.map_err(|e| format!("CouchDB request failed: {e}"))?;
     if !resp.status().is_success() {
@@ -672,12 +652,8 @@ pub fn parse_couchdb_rest_response(status: u16, body_text: &str, start: Instant)
                 let is_string_list = arr.iter().all(|item| item.is_string());
                 if is_string_list {
                     let rows: Vec<Vec<Value>> = arr.iter().map(|item| vec![item.clone()]).collect();
-                    let mut result = couchdb_table_result(
-                        vec!["database".to_string()],
-                        vec!["text".to_string()],
-                        rows,
-                        start,
-                    );
+                    let mut result =
+                        couchdb_table_result(vec!["database".to_string()], vec!["text".to_string()], rows, start);
                     result.elasticsearch_raw_body = Some(body_text.to_string());
                     return Ok(result);
                 }
@@ -762,21 +738,26 @@ mod tests {
 
     #[test]
     fn test_parse_couchdb_sort() {
-        assert_eq!(parse_couchdb_sort(None), None);
-        assert_eq!(parse_couchdb_sort(Some("")), None);
-        let sort_obj = parse_couchdb_sort(Some(r#"{"age": -1, "name": "asc"}"#)).unwrap();
+        assert_eq!(parse_couchdb_sort(None).unwrap(), None);
+        assert_eq!(parse_couchdb_sort(Some("")).unwrap(), None);
+        let sort_obj = parse_couchdb_sort(Some(r#"{"age": -1, "name": "asc"}"#)).unwrap().expect("sort should parse");
         assert!(sort_obj.is_array());
+        assert!(parse_couchdb_sort(Some("not json")).is_err());
+        assert!(parse_couchdb_sort(Some("42")).is_err());
     }
 
     #[test]
     fn test_parse_couchdb_selector() {
-        let sel = parse_couchdb_selector(None);
+        let sel = parse_couchdb_selector(None).unwrap();
         assert_eq!(sel, serde_json::json!({ "_id": { "$gt": null } }));
 
-        let sel = parse_couchdb_selector(Some(r#"{"name": "Alice"}"#));
+        let sel = parse_couchdb_selector(Some(r#"{"name": "Alice"}"#)).unwrap();
         assert_eq!(sel, serde_json::json!({ "name": "Alice" }));
 
-        let sel = parse_couchdb_selector(Some(r#"{"selector": {"name": "Alice"}}"#));
+        let sel = parse_couchdb_selector(Some(r#"{"selector": {"name": "Alice"}}"#)).unwrap();
         assert_eq!(sel, serde_json::json!({ "name": "Alice" }));
+
+        assert!(parse_couchdb_selector(Some("not json")).is_err());
+        assert!(parse_couchdb_selector(Some(r#"["not","an","object"]"#)).is_err());
     }
 }
