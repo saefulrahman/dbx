@@ -260,6 +260,7 @@ pub fn supports_sql_query(database_type: DatabaseType) -> bool {
             | DatabaseType::Elasticsearch
             | DatabaseType::Easysearch
             | DatabaseType::Solr
+            | DatabaseType::CouchDb
             | DatabaseType::Qdrant
             | DatabaseType::Milvus
             | DatabaseType::Weaviate
@@ -518,6 +519,9 @@ pub enum SearchEngineQueryRisk {
 }
 
 pub fn classify_search_engine_query_risk(source: &str, database_type: DatabaseType) -> Option<SearchEngineQueryRisk> {
+    if database_type == DatabaseType::CouchDb {
+        return classify_couchdb_query_risk(source);
+    }
     if database_type == DatabaseType::Solr {
         return classify_solr_query_risk(source);
     }
@@ -565,6 +569,32 @@ pub fn classify_search_engine_query_risk(source: &str, database_type: DatabaseTy
         "PUT" if has_document_id("_doc") || has_document_id("_create") => Some(SearchEngineQueryRisk::Write),
         "DELETE" if has_document_id("_doc") => Some(SearchEngineQueryRisk::Write),
         "POST" | "PUT" | "PATCH" | "DELETE" => Some(SearchEngineQueryRisk::Dangerous),
+        _ => None,
+    }
+}
+
+fn classify_couchdb_query_risk(source: &str) -> Option<SearchEngineQueryRisk> {
+    let source = strip_leading_search_engine_comments(source);
+    let request_line = source.lines().next()?.trim();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?.to_ascii_uppercase();
+    let raw_path = parts.next()?;
+    let path = raw_path.split('?').next().unwrap_or(raw_path).trim_end_matches('/');
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    match method.as_str() {
+        "GET" | "HEAD" | "OPTIONS" => Some(SearchEngineQueryRisk::ReadOnly),
+        "POST"
+            if segments
+                .last()
+                .is_some_and(|s| s.eq_ignore_ascii_case("_find") || s.eq_ignore_ascii_case("_explain") || s.eq_ignore_ascii_case("_all_docs")) =>
+        {
+            Some(SearchEngineQueryRisk::ReadOnly)
+        }
+        "DELETE" if segments.len() <= 1 => Some(SearchEngineQueryRisk::Dangerous),
+        "DELETE" => Some(SearchEngineQueryRisk::Write),
+        "PUT" if segments.len() <= 1 => Some(SearchEngineQueryRisk::Dangerous),
+        "PUT" | "POST" => Some(SearchEngineQueryRisk::Write),
         _ => None,
     }
 }
@@ -2644,6 +2674,35 @@ mod tests {
         assert_eq!(
             classify_search_engine_query_risk("POST /admin/cores?action=CREATE&name=x", DatabaseType::Solr),
             Some(SearchEngineQueryRisk::Dangerous)
+        );
+
+        assert_eq!(
+            classify_search_engine_query_risk("GET /_all_dbs", DatabaseType::CouchDb),
+            Some(SearchEngineQueryRisk::ReadOnly)
+        );
+        assert_eq!(
+            classify_search_engine_query_risk("POST /mydb/_find\n{\"selector\":{}}", DatabaseType::CouchDb),
+            Some(SearchEngineQueryRisk::ReadOnly)
+        );
+        assert_eq!(
+            classify_search_engine_query_risk("POST /mydb\n{\"name\":\"doc\"}", DatabaseType::CouchDb),
+            Some(SearchEngineQueryRisk::Write)
+        );
+        assert_eq!(
+            classify_search_engine_query_risk("PUT /mydb/doc1\n{\"name\":\"doc\"}", DatabaseType::CouchDb),
+            Some(SearchEngineQueryRisk::Write)
+        );
+        assert_eq!(
+            classify_search_engine_query_risk("PUT /mydb", DatabaseType::CouchDb),
+            Some(SearchEngineQueryRisk::Dangerous)
+        );
+        assert_eq!(
+            classify_search_engine_query_risk("DELETE /mydb", DatabaseType::CouchDb),
+            Some(SearchEngineQueryRisk::Dangerous)
+        );
+        assert_eq!(
+            classify_search_engine_query_risk("DELETE /mydb/doc1", DatabaseType::CouchDb),
+            Some(SearchEngineQueryRisk::Write)
         );
         assert_eq!(
             classify_search_engine_query_risk(
