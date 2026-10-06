@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { AlertCircle, Braces, Check, Copy, Download, GitBranch, Table2, FileText, Workflow } from "@lucide/vue";
 import type { ParsedExplainPlan, ExplainPlanNode } from "@/lib/diagram/explainPlan";
@@ -155,6 +155,8 @@ async function copyRawContent() {
     toast(t("explain.copyFailed", { message: error instanceof Error ? error.message : String(error) }), 3000);
   }
 }
+
+onUnmounted(() => window.clearTimeout(copiedTimer));
 
 // Ctrl/Cmd+A inside the XML / TEXT block selects only the plan text, so it can be
 // copied natively instead of being swallowed by the app-wide select-all guard.
@@ -313,13 +315,13 @@ function tableCellText(value: unknown): string {
         </div>
       </div>
 
-      <div v-else class="relative m-3 rounded border bg-muted/30">
+      <div v-else class="relative m-3 rounded border bg-muted/30" :class="rawFormatLabel === 'JSON' ? 'flex h-full min-h-0 flex-col' : ''">
         <Button v-if="rawContent" size="sm" variant="outline" class="absolute right-3 top-2 z-10 h-6 px-2 text-xs gap-1 bg-background/90" data-testid="explain-copy-raw" @click="copyRawContent">
           <Check v-if="copied" class="h-3.5 w-3.5" />
           <Copy v-else class="h-3.5 w-3.5" />
           {{ t("explain.copyRaw", { format: rawFormatLabel }) }}
         </Button>
-        <RedisJsonEditor v-if="rawFormatLabel === 'JSON'" :model-value="rawContent" read-only presentation="viewer" />
+        <RedisJsonEditor v-if="rawFormatLabel === 'JSON'" :model-value="rawContent" read-only presentation="viewer" class="min-h-0 flex-1" />
         <pre v-else data-native-clipboard tabindex="-1" class="overflow-auto whitespace-pre p-3 font-mono text-xs leading-relaxed select-text outline-none" @keydown="onRawKeydown">{{ rawContent }}</pre>
       </div>
     </div>
